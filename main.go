@@ -28,13 +28,15 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"github.com/capi-samples/cluster-api-provider-docker/pkg/container"
-	infrastructurev1alpha1 "github.com/myname/cluster-api-provider-docker/api/v1alpha1"
-	"github.com/myname/cluster-api-provider-docker/controllers"
+	infrastructurev1alpha1 "github.com/odvarkadaniel/cluster-api-provider-docker/api/v1alpha1"
+	"github.com/odvarkadaniel/cluster-api-provider-docker/controllers"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"sigs.k8s.io/cluster-api/controllers/remote"
 	//+kubebuilder:scaffold:imports
 )
 
@@ -101,6 +103,29 @@ func main() {
 		os.Exit(1)
 	}
 
+	log := ctrl.Log.WithName("remote").WithName("ClusterCacheTracker")
+	tracker, err := remote.NewClusterCacheTracker(
+		mgr,
+		remote.ClusterCacheTrackerOptions{
+			Log:     &log,
+			Indexes: remote.DefaultIndexes,
+		},
+	)
+	if err != nil {
+		setupLog.Error(err, "unable to create cluster cache tracker")
+		os.Exit(1)
+	}
+
+	if err := (&remote.ClusterCacheReconciler{
+		Client:  mgr.GetClient(),
+		Tracker: tracker,
+	}).SetupWithManager(ctx, mgr, controller.Options{
+		MaxConcurrentReconciles: 10,
+	}); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "ClusterCacheReconciler")
+		os.Exit(1)
+	}
+
 	if err = (&controllers.DockerClusterReconciler{
 		Client:           mgr.GetClient(),
 		Scheme:           mgr.GetScheme(),
@@ -110,10 +135,15 @@ func main() {
 		os.Exit(1)
 	}
 	if err = (&controllers.DockerMachineReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:           mgr.GetClient(),
+		ContainerRuntime: runtimeClient,
+		Tracker:          tracker,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "DockerMachine")
+		os.Exit(1)
+	}
+	if err = (&infrastructurev1alpha1.DockerCluster{}).SetupWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create webhook", "webhook", "DockerCluster")
 		os.Exit(1)
 	}
 	//+kubebuilder:scaffold:builder

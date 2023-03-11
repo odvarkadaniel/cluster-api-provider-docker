@@ -26,6 +26,7 @@ import (
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/annotations"
+	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/cluster-api/util/predicates"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -98,6 +99,21 @@ func (r *DockerClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err != nil {
 		return ctrl.Result{}, errors.Wrapf(err, "failed to create helper for managing the externalLoadBalancer")
 	}
+
+	// Initialize the patch helper
+	patchHelper, err := patch.NewHelper(dockerCluster, r.Client)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	// Always attempt to Patch the DockerCluster object and status after each reconciliation.
+	defer func() {
+		if err := patchHelper.Patch(ctx, dockerCluster); err != nil {
+			logger.Error(err, "failed to patch DockerCluster")
+			if rerr == nil {
+				rerr = err
+			}
+		}
+	}()
 
 	// Handle deleted clusters
 	if !dockerCluster.DeletionTimestamp.IsZero() {
