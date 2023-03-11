@@ -31,8 +31,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
+	"github.com/capi-samples/cluster-api-provider-docker/pkg/container"
 	infrastructurev1alpha1 "github.com/myname/cluster-api-provider-docker/api/v1alpha1"
 	"github.com/myname/cluster-api-provider-docker/controllers"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	//+kubebuilder:scaffold:imports
 )
 
@@ -46,6 +48,8 @@ func init() {
 
 	utilruntime.Must(infrastructurev1alpha1.AddToScheme(scheme))
 	//+kubebuilder:scaffold:scheme
+
+	utilruntime.Must(clusterv1.AddToScheme(scheme))
 }
 
 func main() {
@@ -89,10 +93,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	ctx := ctrl.SetupSignalHandler()
+	// Set our runtime client into the context for later use
+	runtimeClient, err := container.NewDockerClient()
+	if err != nil {
+		setupLog.Error(err, "unable to establish container runtime connection", "controller", "reconciler")
+		os.Exit(1)
+	}
+
 	if err = (&controllers.DockerClusterReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		ContainerRuntime: runtimeClient,
+	}).SetupWithManager(ctx, mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "DockerCluster")
 		os.Exit(1)
 	}
@@ -115,7 +128,7 @@ func main() {
 	}
 
 	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}

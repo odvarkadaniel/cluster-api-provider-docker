@@ -19,18 +19,31 @@ package controllers
 import (
 	"context"
 
+	"github.com/capi-samples/cluster-api-provider-docker/pkg/container"
+	"github.com/capi-samples/cluster-api-provider-docker/pkg/docker"
+	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/klog/v2"
+	"sigs.k8s.io/cluster-api/util"
+	"sigs.k8s.io/cluster-api/util/annotations"
+	"sigs.k8s.io/cluster-api/util/predicates"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
-	infrastructurev1alpha1 "github.com/myname/cluster-api-provider-docker/api/v1alpha1"
+	infrav1 "github.com/capi-samples/cluster-api-provider-docker/api/v1alpha1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 )
 
 // DockerClusterReconciler reconciles a DockerCluster object
 type DockerClusterReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme           *runtime.Scheme
+	ContainerRuntime container.Runtime
 }
 
 //+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=dockerclusters,verbs=get;list;watch;create;update;patch;delete
@@ -46,17 +59,114 @@ type DockerClusterReconciler struct {
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.14.1/pkg/reconcile
-func (r *DockerClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = log.FromContext(ctx)
 
-	// TODO(user): your logic here
+//+kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;clusters/status,verbs=get;list;watch
+
+func (r *DockerClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, rerr error) {
+	logger := log.FromContext(ctx)
+	ctx = container.RuntimeInto(ctx, r.ContainerRuntime)
+
+	dockerCluster := &infrav1.DockerCluster{}
+	if err := r.Client.Get(ctx, req.NamespacedName, dockerCluster); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
+	}
+
+	// Get the Cluster
+	cluster, err := util.GetOwnerCluster(ctx, r.Client, dockerCluster.ObjectMeta)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if cluster == nil {
+		logger.Info("Waiting for Cluster Controller to set OwnerRef on DockerCluster")
+		return ctrl.Result{}, nil
+	}
+
+	logger = logger.WithValues("cluster", klog.KObj(cluster))
+	ctx = ctrl.LoggerInto(ctx, logger)
+
+	if annotations.IsPaused(cluster, dockerCluster) {
+		logger.Info("DockerCluster or owning Cluster is marked as paused, not reconciling")
+
+		return ctrl.Result{}, nil
+	}
+
+	// Create a helper for managing a docker container hosting the loadbalancer.
+	externalLoadBalancer, err := docker.NewLoadBalancer(ctx, cluster, dockerCluster)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrapf(err, "failed to create helper for managing the externalLoadBalancer")
+	}
+
+	// Handle deleted clusters
+	if !dockerCluster.DeletionTimestamp.IsZero() {
+		return r.reconcileDelete(ctx, dockerCluster, externalLoadBalancer)
+	}
+
+	return r.reconcileNormal(ctx, dockerCluster, externalLoadBalancer)
+}
+
+func (r *DockerClusterReconciler) reconcileNormal(ctx context.Context, dockerCluster *infrav1.DockerCluster, externalLoadBalancer *docker.LoadBalancer) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	logger.Info("Reconciling DockerCluster")
+
+	if !controllerutil.ContainsFinalizer(dockerCluster, infrav1.ClusterFinalizer) {
+		controllerutil.AddFinalizer(dockerCluster, infrav1.ClusterFinalizer)
+
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Create the docker container hosting the load balancer if it does not exist.
+	if err := externalLoadBalancer.Create(ctx); err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "failed to create load balancer")
+	}
+
+	// Get the load balancer IP so we can use it for the enpoint address
+	lbIP, err := externalLoadBalancer.IP(ctx)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "failed to get IP for the load balancer")
+	}
+
+	dockerCluster.Spec.ControlPlaneEndpoint = clusterv1.APIEndpoint{
+		Host: lbIP,
+		Port: 6443,
+	}
+
+	dockerCluster.Status.Ready = true
+
+	return ctrl.Result{}, nil
+}
+
+func (r *DockerClusterReconciler) reconcileDelete(ctx context.Context, dockerCluster *infrav1.DockerCluster, externalLoadBalancer *docker.LoadBalancer) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	logger.Info("Reconciling DockerCluster deletion")
+
+	// Delete the docker container hosting the load balancer
+	if err := externalLoadBalancer.Delete(ctx); err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "failed to delete load balancer")
+	}
+
+	// Cluster is deleted so remove the finalizer.
+	controllerutil.RemoveFinalizer(dockerCluster, infrav1.ClusterFinalizer)
 
 	return ctrl.Result{}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *DockerClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&infrastructurev1alpha1.DockerCluster{}).
-		Complete(r)
+func (r *DockerClusterReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager) error {
+	c, err := ctrl.NewControllerManagedBy(mgr).
+		For(&infrav1.DockerCluster{}).
+		//WithOptions(options).
+		WithEventFilter(predicates.ResourceNotPaused(ctrl.LoggerFrom(ctx))).
+		Build(r)
+	if err != nil {
+		return err
+	}
+
+	return c.Watch(
+		&source.Kind{Type: &clusterv1.Cluster{}},
+		handler.EnqueueRequestsFromMapFunc(util.ClusterToInfrastructureMapFunc(ctx, infrav1.GroupVersion.WithKind("DockerCluster"), mgr.GetClient(), &infrav1.DockerCluster{})),
+		predicates.ClusterUnpaused(ctrl.LoggerFrom(ctx)),
+	)
 }
